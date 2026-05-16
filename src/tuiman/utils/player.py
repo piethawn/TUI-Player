@@ -1,5 +1,7 @@
 import io
+import struct
 import subprocess
+import threading
 import mutagen
 import os
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
@@ -13,11 +15,43 @@ PYGAME_NATIVE_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".mid", ".midi", ".
 # lose the reference while the song is playing.
 _audio_buffer: Optional[io.BytesIO] = None
 
+# Waveform: normalized amplitude (0.0–1.0) per display column, populated async.
+_waveform: list[float] = []
+
 # module-level state
 _current_album: Optional[str] = None
 _current_song: Optional[str] = "-----"
 _current_duration: float = 0.0
 _paused: bool = False
+
+def get_waveform() -> list[float]:
+    return _waveform
+
+
+def _build_waveform(path: str, num_cols: int) -> None:
+    """Decode to 200 Hz mono via ffmpeg and compute peak amplitude per column."""
+    global _waveform
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", path,
+             "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "200", "-ac", "1", "-"],
+            capture_output=True, timeout=30,
+        )
+        data = result.stdout
+        if not data:
+            return
+        n = len(data) // 2
+        samples = struct.unpack(f"<{n}h", data)
+        chunk = max(1, n // num_cols)
+        peaks = []
+        for i in range(num_cols):
+            block = samples[i * chunk : min((i + 1) * chunk, n)]
+            peaks.append(max(abs(s) for s in block) / 32768.0 if block else 0.0)
+        hi = max(peaks) or 1.0
+        _waveform = [v / hi for v in peaks]
+    except Exception:
+        pass
+
 
 def init_player() -> None:
     """Call once at app startup."""
@@ -38,7 +72,7 @@ def play_song(data_dict: dict, song_name: str) -> bool:
     Play a song by name, searching across all albums.
     Returns True on success, False if song not found.
     """
-    global _current_album, _current_duration, _current_song, _paused, _audio_buffer
+    global _current_album, _current_duration, _current_song, _paused, _audio_buffer, _waveform
 
     for album_name, data in data_dict.items():
         if song_name not in data["songs"]:
@@ -62,6 +96,9 @@ def play_song(data_dict: dict, song_name: str) -> bool:
         _current_album = album_name
         _current_song = song_name
         _paused = False
+        # Clear stale waveform immediately, then rebuild in background
+        _waveform = []
+        threading.Thread(target=_build_waveform, args=(path, 300), daemon=True).start()
         return True
 
     return False

@@ -1,9 +1,9 @@
+from rich.text import Text as RichText
 from textual.app import ComposeResult
-from textual.color import Gradient, Color
-from textual.reactive import reactive
+from textual.color import Color
 from textual.widget import Widget
-from textual.widgets import Button, Label, ProgressBar
-from ..utils.player import get_progress, get_current, pause, resume
+from textual.widgets import Button
+from ..utils.player import get_progress, get_waveform, pause, resume
 
 
 class PlayControls(Widget):
@@ -35,47 +35,71 @@ class PlayControls(Widget):
                 play_btn.styles.color = Color(255, 255, 255, 0.7)
 
 
-class Playback(Widget):
-    """Displays playing bar. Everything from updating the Playing: to the progressbar seems to be autonomous (depends
-    on output give by player.py)"""
-    current_song = reactive("-----")
+_WAVE_CHARS = " ▁▂▃▄▅▆▇█"
+_NUM_ROWS = 3
 
-    def compose(self) -> ComposeResult:
-        gradient = Gradient.from_colors("#881177","#aa3355","#cc6666","#ee9944","#eedd00","#99dd55","#44dd88","#22ccbb","#00bbcc","#0099cc","#3366bb","#663399",)
-        yield Label("Playing: -----", id="song-name")
-        yield ProgressBar(total=100, show_eta=False, show_percentage=False, gradient=gradient)
+
+class Visualizer(Widget):
+    """Scrolling waveform display. Pre-computed amplitude, cursor tracks playback."""
+
+    DEFAULT_CSS = """
+    Visualizer {
+        width: 100%;
+        height: 3;
+        color: $accent;
+    }
+    """
 
     def on_mount(self) -> None:
-        """Progress bar"""
-        self.set_interval(1 /30, self.make_progress)
-        self.set_interval(1/30 , self.sync_song)
+        self.set_interval(1 / 15, self.refresh)
 
-    @staticmethod
-    def _fmt(seconds: float) -> str:
-        s = int(seconds)
-        return f"{s // 60}:{s % 60:02d}"
+    def render(self) -> RichText:
+        waveform = get_waveform()
+        progress = get_progress()
+        width = max(1, self.size.width)
 
-    def make_progress(self) -> None:
-        """Called automatically to advance the progress bar."""
-        progress = 0
-        time_stamps = get_progress()
-        if not time_stamps[2]:
-            try:
-                progress = int((time_stamps[0]/time_stamps[1]) * 100)
-            except ZeroDivisionError:
-                progress = 0
-        self.query_one(ProgressBar).update(progress=progress)
-        elapsed = self._fmt(time_stamps[0])
-        total = self._fmt(time_stamps[1])
-        self.query_one("#song-name", Label).update(f"Playing: {self.current_song}    {elapsed} / {total}")
+        try:
+            pos_frac = progress[0] / progress[1] if progress[1] > 0 else 0.0
+        except ZeroDivisionError:
+            pos_frac = 0.0
 
-    def sync_song(self)->None:
-        c_song = get_current().get("song")
-        if c_song != self.current_song:
-            self.current_song = c_song
+        # Waveform scrolls: playhead fixed at 1/3, data shifts left
+        anchor = width // 3
+        wf_len = len(waveform)
+        center_idx = int(pos_frac * wf_len) if wf_len > 0 else 0
 
-    def watch_current_song(self, song):
-        self.query_one("#song-name", Label).update(f"Playing: {song}")
+        try:
+            c = self.styles.color
+            color = f"#{c.r:02x}{c.g:02x}{c.b:02x}"
+        except Exception:
+            color = "#00e676"
+
+        total_units = _NUM_ROWS * 8
+        rows: list[list[tuple[str, str]]] = [[] for _ in range(_NUM_ROWS)]
+
+        for i in range(width):
+            wf_idx = center_idx + (i - anchor)
+            amp = waveform[wf_idx] if waveform and 0 <= wf_idx < wf_len else 0.0
+            units = int(amp * total_units)
+
+            for r in range(_NUM_ROWS):
+                row_from_bottom = _NUM_ROWS - 1 - r
+                row_units = units - row_from_bottom * 8
+                if row_units >= 8:
+                    char = "█"
+                elif row_units > 0:
+                    char = _WAVE_CHARS[row_units]
+                else:
+                    char = " "
+                rows[r].append((char, color))
+
+        text = RichText()
+        for r, row in enumerate(rows):
+            for char, style in row:
+                text.append(char, style=style)
+            if r < _NUM_ROWS - 1:
+                text.append("\n")
+        return text
 
 class QueueOptions(Widget):
     """show/ hide queue, shuffle options"""
@@ -90,8 +114,8 @@ class QueueOptions(Widget):
         self.query_one("#shuffle-queue").border_subtitle = "queue"
 
 class BottomBox(Widget):
-    """Class containing play controls and playback bar"""
+    """Class containing play controls and waveform visualizer"""
     def compose(self) -> ComposeResult:
         yield PlayControls()
-        yield Playback()
+        yield Visualizer()
         yield QueueOptions()
