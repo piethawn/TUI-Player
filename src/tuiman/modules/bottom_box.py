@@ -43,12 +43,17 @@ class Playback(Widget):
     def compose(self) -> ComposeResult:
         gradient = Gradient.from_colors("#881177","#aa3355","#cc6666","#ee9944","#eedd00","#99dd55","#44dd88","#22ccbb","#00bbcc","#0099cc","#3366bb","#663399",)
         yield Label("Playing: -----", id="song-name")
-        yield ProgressBar(total=100, show_eta=False, gradient=gradient)
+        yield ProgressBar(total=100, show_eta=False, show_percentage=False, gradient=gradient)
 
     def on_mount(self) -> None:
         """Progress bar"""
         self.set_interval(1 /30, self.make_progress)
         self.set_interval(1/30 , self.sync_song)
+
+    @staticmethod
+    def _fmt(seconds: float) -> str:
+        s = int(seconds)
+        return f"{s // 60}:{s % 60:02d}"
 
     def make_progress(self) -> None:
         """Called automatically to advance the progress bar."""
@@ -60,6 +65,9 @@ class Playback(Widget):
             except ZeroDivisionError:
                 progress = 0
         self.query_one(ProgressBar).update(progress=progress)
+        elapsed = self._fmt(time_stamps[0])
+        total = self._fmt(time_stamps[1])
+        self.query_one("#song-name", Label).update(f"Playing: {self.current_song}    {elapsed} / {total}")
 
     def sync_song(self)->None:
         c_song = get_current().get("song")

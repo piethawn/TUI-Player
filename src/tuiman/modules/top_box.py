@@ -6,12 +6,11 @@ from textual.app import ComposeResult, RenderResult
 from textual.containers import VerticalScroll
 from textual.reactive import reactive
 from textual.widget import Widget
-from textual.widgets import Input, OptionList, RadioSet, RadioButton, Markdown, LoadingIndicator
+from textual.widgets import Input, Label, OptionList, RadioSet, RadioButton, LoadingIndicator
 from ..utils.caching import Cache
-from ..utils.library_manager import search_function, load_library
-from ..utils.lyrics import extract_lyrics
+from ..utils.library_manager import search_function, load_library, get_song_art
 from ..utils.models import ReversibleIterator
-from ..utils.player import get_progress, play_song
+from ..utils.player import get_current, get_progress, play_song
 
 cache = Cache()
 UNKNOWN_COVER_PATH = str(Path(__file__).resolve().parent.parent / "media" / "unknown.png")
@@ -99,85 +98,45 @@ class SongList(Widget):
             self.current_songs.append(song)
             option_list.add_option(song)
 
-class RightPane(Widget):
-    pass
-class LyricBox(Widget):
-    """Display song lyrics"""
+class NowPlayingBox(Widget):
+    """Displays currently playing song name and live elapsed/total time."""
 
-    current_index: reactive[int] = reactive(-1)
-    current_song_path: reactive[str] = reactive("")
-    def __init__(self):
-        super().__init__()
-        self.parsed_lyrics = []
+    DEFAULT_CSS = """
+    NowPlayingBox {
+        border: dashed round deeppink;
+        width: 100%;
+        height: 5;
+        background: black 10%;
+    }
+    #np-song { text-style: bold; padding-left: 1; }
+    #np-time { padding-left: 1; color: $accent; }
+    """
 
-    @work(exclusive=True, group="lyrics", exit_on_error=False)
-    async def load_lyrics(self, path: str) -> None:
-        try:
-            cached_lyrics = await cache.find_cache(song_path=path)
-            if cached_lyrics is not None:
-                lyrics = cached_lyrics
-            else:
-                lyrics = (await extract_lyrics(path=path)).get("lyrics", [])
-
-        except Exception:
-            lyrics = []
-        if path != self.current_song_path:
-            return
-
-        self.parsed_lyrics = lyrics
-
-    def watch_current_song_path(self, path: str) -> None:
-        self.current_index = -1
-        self.parsed_lyrics = []
-        self.query_one(Markdown).update("")
-
-        if path:
-            self.load_lyrics(path)
+    @staticmethod
+    def _fmt(seconds: float) -> str:
+        s = int(seconds)
+        return f"{s // 60}:{s % 60:02d}"
 
     def compose(self) -> ComposeResult:
-        yield Markdown("")
+        yield Label("-----", id="np-song")
+        yield Label("0:00 / 0:00", id="np-time")
 
     def on_mount(self) -> None:
-        self.border_title = "Lyrics"
-        # Poll every 1/30ms
-        self.set_interval(1/30, self.update_lyrics)
+        self.border_title = "Now Playing"
+        self.set_interval(1 / 5, self.refresh_display)
 
-    def update_lyrics(self) -> None:
-        if not self.parsed_lyrics:
-            return
-
+    def refresh_display(self) -> None:
+        current = get_current()
         progress = get_progress()
+        song = current.get("song") or "-----"
+        elapsed = self._fmt(progress[0])
+        total = self._fmt(progress[1])
+        self.query_one("#np-song", Label).update(song)
+        self.query_one("#np-time", Label).update(f"{elapsed} / {total}")
 
-        if progress[2]: # song ended
-            return
 
-        now = progress[0]  # how much the song has finished
-
-        # Find the latest lyric whose time <= now
-        idx = -1
-        for i, (t, _) in enumerate(self.parsed_lyrics):
-            if t <= now:
-                idx = i
-            else:
-                break
-
-        if idx != self.current_index:
-            self.current_index = idx
-
-    def watch_current_index(self, idx: int) -> None:
-        """Called automatically when current_index changes"""
-        if not self.parsed_lyrics or idx == -1:
-            self.query_one(Markdown).update("")
-            return
-
-        lyrics = self.parsed_lyrics
-
-        prev_text = f"*{lyrics[idx - 1][1]}*  " if idx > 0 else ""
-        curr_text = f"**{lyrics[idx][1]}**  "
-        next_text = f"*{lyrics[idx + 1][1]}*  " if idx < len(lyrics) - 1 else ""
-
-        content = "\n".join(filter(bool, [prev_text, curr_text, next_text]))
-        self.query_one(Markdown).update(content)
+class RightPane(Widget):
+    pass
 
 class LeftPane(Widget):
     pass
@@ -208,7 +167,7 @@ class TopBox(Widget):
             yield QueueBox()
         with RightPane():
             yield SongList(self.data_dict)
-            yield LyricBox()
+            yield NowPlayingBox()
         yield AlbumCover()
 
     def on_mount(self) -> None:
@@ -251,14 +210,13 @@ class TopBox(Widget):
                 qb.mount(RadioButton(f"{song}"))
 
     def song_manager(self, song_name: str) -> None:
-        """ plays song, updates queue, loads lyrics"""
-        # play song using player
+        """Plays song, updates cover art and queue."""
         if not play_song(data_dict=self.data_dict, song_name=song_name):
             return
-        # load song lyrics
         path = self.data_dict.get(self.current_album, {}).get("songs", {}).get(song_name, "")
-        self.query_one(LyricBox).current_song_path = path
-        # update queue box
+        art_path = get_song_art(path, cache)
+        if art_path:
+            self.query_one(AlbumCover).path = art_path
         self.update_queue_box(song_name=song_name)
 
     def set_album_queue(self, song_name: str):

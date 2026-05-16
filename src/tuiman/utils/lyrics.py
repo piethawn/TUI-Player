@@ -3,6 +3,7 @@ import os
 import re
 import httpx
 import mutagen.id3
+from mutagen.mp4 import MP4
 from httpx import ReadTimeout
 from .caching import Cache
 
@@ -39,59 +40,79 @@ async def parse_lrc_lyrics(lrc_text: str) -> list[tuple[float, str]]:
     return sorted(results, key=lambda x: x[0])
 
 
+def _meta_from_filename(path: str) -> dict:
+    """Parse artist/title from SoundCloud-style filenames like '[ID] Artist – Title'."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = re.sub(r'^\[\d+\]\s*', '', stem)  # strip leading [ID]
+    parts = re.split(r'\s+[–\-]\s+', stem, maxsplit=1)
+    if len(parts) == 2:
+        return {"artist": parts[0].strip(), "title": parts[1].strip()}
+    return {"title": stem.strip()}
+
+
 async def extract_lyrics(path: str) -> dict:
     """
-    Extracts synced lyrics from an mp3's ID3 tags (SYLT frame).
-    Falls back to LRCLIB
-    Stores lyrics in .cache
-    Returns {"lyrics": [(time_ms: float, "text": str), ...]}
+    Extracts synced lyrics from embedded tags (SYLT for mp3, or unsync for m4a).
+    Falls back to LRCLIB using embedded or filename-parsed metadata.
+    Stores lyrics in .cache.
+    Returns {"lyrics": [(timestamp_secs: float, text: str), ...]}
     """
     if not os.path.exists(path):
         return {"lyrics": []}
 
-    try:
-        tags = mutagen.id3.ID3(path)
-    except mutagen.id3.ID3NoHeaderError:
-        return {"lyrics": []}
-
-    # synced lyrics — stores (text, timestamp_in_ms) tuples
+    suffix = os.path.splitext(path)[1].lower()
     song_meta = {}
-    for key in tags.keys():
-        # synced lyrics found
-        if key.startswith("SYLT"):
-            sylt = tags[key]
-            lyrics = [
-                (round(ms / 1000.0, 3), text.strip())
-                for text, ms in sylt.text
-                if text.strip()
-            ]
-            lyrics.sort(key=lambda x: x[0])
-            # caching those lyrics
-            await lyrics_cache.create_cache(song_path=path, lyrics=lyrics)
-            return {"lyrics": lyrics}
-        else:
-            #track name
-            if key.startswith("TIT2"):
-                song_meta["title"] = tags[key].text
-            #artist name
-            if key.startswith("TPE1"):
-                song_meta["artist"] = tags[key].text
-            #album name
-            if key.startswith("TALB"):
-                song_meta["album"] = tags[key].text
 
-    # Try to fetch lyrics from LRCLIB
+    if suffix in {".m4a", ".aac", ".mp4"}:
+        try:
+            tags = MP4(path)
+            if "\xa9nam" in tags:
+                song_meta["title"] = tags["\xa9nam"][0]
+            if "\xa9ART" in tags:
+                song_meta["artist"] = tags["\xa9ART"][0]
+            if "\xa9alb" in tags:
+                song_meta["album"] = tags["\xa9alb"][0]
+        except Exception:
+            pass
+    else:
+        try:
+            tags = mutagen.id3.ID3(path)
+        except mutagen.id3.ID3NoHeaderError:
+            tags = {}
+
+        for key in tags.keys():
+            if key.startswith("SYLT"):
+                sylt = tags[key]
+                lyrics = [
+                    (round(ms / 1000.0, 3), text.strip())
+                    for text, ms in sylt.text
+                    if text.strip()
+                ]
+                lyrics.sort(key=lambda x: x[0])
+                await lyrics_cache.create_cache(song_path=path, lyrics=lyrics)
+                return {"lyrics": lyrics}
+            if key.startswith("TIT2"):
+                song_meta["title"] = tags[key].text[0] if tags[key].text else None
+            if key.startswith("TPE1"):
+                song_meta["artist"] = tags[key].text[0] if tags[key].text else None
+            if key.startswith("TALB"):
+                song_meta["album"] = tags[key].text[0] if tags[key].text else None
+
+    # Fill missing title/artist from filename
+    if not song_meta.get("title"):
+        song_meta.update(_meta_from_filename(path))
+
+    # Try to fetch synced lyrics from LRCLIB
     try:
         synced_lyrics = await lrclib(**song_meta)
-    except ReadTimeout:
-        synced_lyrics = []
+    except (ReadTimeout, Exception):
+        synced_lyrics = None
+
     if synced_lyrics:
         lyrics = await parse_lrc_lyrics(lrc_text=synced_lyrics)
-        # caching those lyrics
         await lyrics_cache.create_cache(song_path=path, lyrics=lyrics)
         return {"lyrics": lyrics}
 
-    # nothing found, store empty list
     await lyrics_cache.create_cache(song_path=path, lyrics=[])
     return {"lyrics": []}
 
